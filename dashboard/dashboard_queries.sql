@@ -37,7 +37,10 @@ ORDER BY hour;
 SELECT date, avg_temp_c, avg_price_eur_mwh
 FROM raw.electricity.gold_daily;
 
--- DATASET 6: forecast  (line: actual vs predicted demand, test period)
+-- DATASET 6: forecast  (line: actual vs predicted demand, last 14 days, hourly)
+-- Short hourly window so the model tracking the daily peaks/troughs is visible
+-- (the full test period summed to millions and hid the fit).
 SELECT hour_local, consumption_mwh AS actual_mwh, predicted_mwh
 FROM raw.electricity.gold_demand_forecast
+WHERE hour_local >= (SELECT max(hour_local) FROM raw.electricity.gold_demand_forecast) - INTERVAL 14 DAYS
 ORDER BY hour_local;
