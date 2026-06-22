@@ -45,7 +45,7 @@ import time
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta   # available in Fabric runtime
 
 def month_chunks(start_date, end_date):
@@ -133,35 +133,77 @@ wdf.write.format("delta").mode("overwrite").saveAsTable("bronze_fmi_weather")
 print(f"  -> bronze_fmi_weather: {len(weather)} rows")
 
 
-# ==== CELL 5 — ENTSO-E price → bronze (FILL WHEN TOKEN ARRIVES) =============
+# ==== CELL 5 — ENTSO-E price → bronze ======================================
 # Day-ahead spot price, bidding zone Finland (10YFI-1--------U), documentType A44.
-# Uncomment and set ENTSOE_TOKEN once the email access is granted.
-#
-# ENTSOE_TOKEN = "PASTE_TOKEN"
-# def fetch_entsoe_price(start_date, end_date):
-#     out = []
-#     for c_start, c_end in month_chunks(start_date, end_date):
-#         params = {
-#             "securityToken": ENTSOE_TOKEN, "documentType": "A44",
-#             "in_Domain": "10YFI-1--------U", "out_Domain": "10YFI-1--------U",
-#             "periodStart": c_start.strftime("%Y%m%d%H%M"),
-#             "periodEnd": c_end.strftime("%Y%m%d%H%M"),
-#         }
-#         r = requests.get("https://web-api.tp.entsoe.eu/api", params=params, timeout=120)
-#         r.raise_for_status()
-#         root = ET.fromstring(r.content)
-#         # parse TimeSeries > Period (start + resolution) > Point (position, price.amount)
-#         # -> expand each point to an absolute hourly timestamp
-#         ...  # (will complete this together once you have the token + a sample response)
-#     return out
-#
-# price = fetch_entsoe_price(START_DATE, END_DATE)
-# spark.createDataFrame(pd.DataFrame(price)).write.format("delta")\
-#      .mode("overwrite").saveAsTable("bronze_entsoe_price")
+# NB: don't commit the token / show it in screenshots.
+ENTSOE_TOKEN = "PASTE_YOUR_ENTSOE_TOKEN_HERE"
+
+_RES_MIN = {"PT60M": 60, "PT30M": 30, "PT15M": 15}   # resolution code -> minutes
+
+def _local(tag):
+    return tag.split("}")[-1]   # strip XML namespace
+
+def fetch_entsoe_price(start_date, end_date):
+    """Day-ahead prices → list of {time(UTC ISO), price_eur_mwh, resolution}.
+    Expands each Period's positions to absolute timestamps, carrying the last
+    known price forward over gaps (ENTSO-E A03 curve omits unchanged points)."""
+    out = []
+    for c_start, c_end in month_chunks(start_date, end_date):
+        params = {
+            "securityToken": ENTSOE_TOKEN, "documentType": "A44",
+            "in_Domain": "10YFI-1--------U", "out_Domain": "10YFI-1--------U",
+            "periodStart": c_start.strftime("%Y%m%d%H%M"),
+            "periodEnd": c_end.strftime("%Y%m%d%H%M"),
+        }
+        r = requests.get("https://web-api.tp.entsoe.eu/api", params=params, timeout=120)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for period in root.iter():
+            if _local(period.tag) != "Period":
+                continue
+            res, base = None, None
+            prices = {}
+            for child in period:
+                lt = _local(child.tag)
+                if lt == "resolution":
+                    res = child.text
+                elif lt == "timeInterval":
+                    for c in child:
+                        if _local(c.tag) == "start":
+                            base = datetime.fromisoformat(c.text.replace("Z", "+00:00"))
+            for pt in period.iter():
+                if _local(pt.tag) != "Point":
+                    continue
+                pos = price = None
+                for c in pt:
+                    if _local(c.tag) == "position":
+                        pos = int(c.text)
+                    elif _local(c.tag) == "price.amount":
+                        price = float(c.text)
+                if pos is not None and price is not None:
+                    prices[pos] = price
+            if not prices or base is None:
+                continue
+            step = _RES_MIN.get(res, 60)
+            last = None
+            for i in range(1, max(prices) + 1):
+                if i in prices:
+                    last = prices[i]
+                ts = base + timedelta(minutes=step * (i - 1))
+                out.append({"time": iso_z(ts), "price_eur_mwh": last, "resolution": res})
+    return out
+
+print("ENTSO-E day-ahead price ...")
+price = fetch_entsoe_price(START_DATE, END_DATE)
+pdf_price = pd.DataFrame(price).drop_duplicates(subset="time")
+spark.createDataFrame(pdf_price).write.format("delta")\
+     .mode("overwrite").saveAsTable("bronze_entsoe_price")
+print(f"  -> bronze_entsoe_price: {pdf_price.shape[0]} rows")
 
 
 # ==== CELL 6 — sanity check ================================================
 for name in FINGRID_DATASETS:
     n = spark.table(f"bronze_fingrid_{name}").count()
     print(f"bronze_fingrid_{name:16s}: {n:>8} rows")
-print("bronze_fmi_weather       :", spark.table("bronze_fmi_weather").count(), "rows")
+print(f"{'bronze_fmi_weather':30s}: {spark.table('bronze_fmi_weather').count():>8} rows")
+print(f"{'bronze_entsoe_price':30s}: {spark.table('bronze_entsoe_price').count():>8} rows")
