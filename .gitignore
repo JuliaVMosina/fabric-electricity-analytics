@@ -1,0 +1,22 @@
+# Secrets — never commit API keys / tokens
+.env
+*.key
+secrets.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Data (raw pulls / local exports — keep the repo about the code, not the data)
+data/
+*.csv
+*.parquet
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
