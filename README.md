@@ -1,70 +1,90 @@
-# Finnish Electricity Market Analytics — Fabric pet-project #2
+# Finnish Electricity Market Analytics — Databricks Lakehouse
 
-Code-first **PySpark medallion lakehouse** on real Finnish open data.
-Companion to project #1 (F-Group Retail): #1 = low-code (Data Factory Copy job + T-SQL Warehouse),
-#2 = **code-first PySpark notebooks + live multi-source APIs**.
+End-to-end **PySpark medallion lakehouse** on **Databricks** over real Finnish open data:
+electricity consumption, production mix, day-ahead price and weather — cleaned, modelled,
+forecast, and surfaced in a native Databricks AI/BI dashboard.
 
-Closes the **Databricks / distributed-computing GAP** (Konecranes) and maps onto **DP-600**
-Spark + notebooks + semantic model (KONE). Forecast layer nods to "AI-assisted BI" (KONE).
+> Companion to my [Microsoft Fabric retail project](https://github.com/JuliaVMosina) —
+> that one is the low-code path (Data Factory + T-SQL warehouse); this one is the
+> **code-first Spark path**: PySpark notebooks, Delta tables, Spark ML, Unity Catalog.
 
----
-
-## Data sources (3 heterogeneous → "data integration from multiple sources")
-
-| Source | What | Auth | Format |
-|---|---|---|---|
-| **Fingrid Open Data** | consumption, production by type (wind/nuclear/hydro/solar), total | `x-api-key` header (free, instant) | JSON/CSV |
-| **ENTSO-E Transparency** | day-ahead spot price, bidding zone Finland (`10YFI-1--------U`) | security token (free, **up to 3 working days**) | XML |
-| **FMI Open Data** | weather: temperature, wind speed (drivers of demand & wind gen) | none | XML (WFS) |
-
-### Getting access (do this first — ENTSO-E has a lead time)
-1. **Fingrid** — register at https://data.fingrid.fi/en → developer portal → get personal `x-api-key`.
-   Browse datasets at https://data.fingrid.fi/en/datasets and note the `datasetId` of each series you want.
-   Limits: 10 000 req / 24 h, 1 req / 2 s.
-2. **ENTSO-E** — register at https://transparency.entsoe.eu/ → then email **transparency@entsoe.eu**,
-   subject **"RESTful API access"**, body = your registered email. Token arrives within ~3 working days.
-   ⚠️ **Send this email today** so it isn't a blocker.
-3. **FMI** — no key. WFS at https://opendata.fmi.fi/wfs.
-
-Put keys in env vars before running the local check (PowerShell):
-```powershell
-$env:FINGRID_API_KEY = "your-key"
-$env:ENTSOE_TOKEN    = "your-token"   # once it arrives
-```
+![Architecture](architecture.svg)
 
 ---
 
-## Architecture — medallion
+## What it does
 
 ```
-APIs ──► BRONZE (raw, as-fetched)        Lakehouse Files/, partitioned by source+date
-          │   PySpark: parse, type-cast, dedupe, unit-normalize, UTC align
-          ▼
-        SILVER (clean, conformed)         Delta tables: fact_hourly + dim_date / dim_zone / dim_production_type
-          │   PySpark: hourly join (consumption ⋈ production ⋈ price ⋈ weather)
-          ▼
-        GOLD (marts + forecast)           Delta: mart_energy_balance, mart_price_demand, pred_demand
-          ▼
-        Semantic model (DirectLake) ──► Power BI report
+  Fingrid API        ENTSO-E API         FMI API
+ (consumption,      (day-ahead spot     (temperature,
+  production mix)     price, FI zone)     wind speed)
+        │                  │                  │
+        └──────────────────┼──────────────────┘
+                           ▼
+   BRONZE   raw, as-fetched           8 Delta tables · 1.2M+ rows
+                           │   PySpark: parse · type · dedupe
+                           ▼
+   SILVER   clean & conformed         silver_energy_hourly (12,407 h) + dim_date
+                           │   resample 3-min/15-min → hourly · harmonise units → MWh/h
+                           │   join all sources on the hour · Helsinki-local calendar
+                           ▼
+   GOLD     marts + ML forecast       gold_daily · gold_hour_of_day · gold_demand_forecast
+                           │   Spark ML (GBT) demand forecast
+                           ▼
+            Databricks AI/BI dashboard
 ```
 
-### Gold marts (planned)
-- `mart_energy_balance` — production vs consumption, renewable share % by hour/day
-- `mart_price_demand` — spot price ⋈ demand ⋈ temperature (correlation, peak hours)
-- `pred_demand` — simple demand forecast (regression: demand ~ temp + hour + weekday), MAE reported
+## Results & insights
+- **Finland is a net electricity importer** — production averages 9,100 MWh/h vs 9,624 MWh/h demand.
+- **Spot price rises as temperature falls** — cold snaps drive electric-heating demand.
+- **Renewables ≈ 42%** of generation on average; wind's share grows noticeably toward winter.
+- **Demand forecast** (Spark ML GBT, honest 90-day time holdout):
+  **MAE 366 MWh = 3.8 %** of average demand, **R² 0.74**.
+  Top drivers: *yesterday's demand* (lag-24h) and *temperature*.
+
+## Tech stack
+Databricks (Free Edition, serverless) · PySpark · Spark ML · Delta Lake · Unity Catalog ·
+SQL · Python · REST/WFS APIs · Databricks AI/BI dashboards.
 
 ---
 
-## Build steps in Fabric (once keys validated locally)
-1. Create Lakehouse `electricity_lakehouse`.
-2. Notebook `01_bronze_ingest` (PySpark) — call 3 APIs, write raw to `Files/bronze/...`.
-3. Notebook `02_silver_transform` — clean + conform + hourly join → Delta tables.
-4. Notebook `03_gold_marts` — aggregate marts + forecast.
-5. Orchestrate the 3 notebooks in a Data Factory **pipeline** (scheduled).
-6. Semantic model (DirectLake) + relationships → Power BI report.
+## Pipeline
+
+| Layer | Notebook | Output |
+|-------|----------|--------|
+| Bronze | [`01_bronze_ingest_databricks.py`](notebooks/01_bronze_ingest_databricks.py) | `bronze_fingrid_*`, `bronze_fmi_weather`, `bronze_entsoe_price` |
+| Silver | [`02_silver_transform.py`](notebooks/02_silver_transform.py) | `silver_energy_hourly`, `silver_dim_date` |
+| Gold | [`03_gold_marts.py`](notebooks/03_gold_marts.py) | `gold_daily`, `gold_hour_of_day`, `gold_demand_forecast` |
+| Dashboard | [`dashboard/dashboard_queries.sql`](dashboard/dashboard_queries.sql) | 6 AI/BI datasets |
+
+### Engineering notes (the messy-real-data part)
+- **Mixed resolutions** — sources arrive at 3-min (MW), 15-min and hourly (MWh/h);
+  all resampled to a common **hourly** grain in silver.
+- **Mixed units** — power (MW) vs energy-rate (MWh/h) vs kWh, harmonised to **MWh per hour**.
+- **Rate limits** — Fingrid throttles to 1 req / 2 s; FMI rejects long intervals,
+  so weather is pulled in 7-day chunks at hourly `timestep`.
+- **Time zones** — all sources stored in UTC; reporting calendar is `Europe/Helsinki`.
+
+### Honesty notes
+- `solar` is Fingrid's **forecast** series (Finland has little metered solar) — labelled as such.
+- The forecast uses **actual** weather as a feature; a production day-ahead model would use
+  *forecast* weather. Lag features (24 h / 168 h) are known at day-ahead time, so the holdout is fair.
+- Day-ahead price was **hourly** for most of the window (Finland moved to 15-min later).
 
 ---
 
-## Files here
-- `fetch_sample.py` — local validation: pulls a small sample from each API, prints shape. Run BEFORE Fabric.
-- (notebooks added once keys validated)
+## Data sources & access
+| Source | Data | Auth |
+|--------|------|------|
+| [Fingrid Open Data](https://data.fingrid.fi/en) | consumption (124), production (74), wind (181), nuclear (188), hydro (191), solar fc (247) | free `x-api-key` |
+| [ENTSO-E Transparency](https://transparency.entsoe.eu/) | day-ahead price, zone `10YFI-1--------U` | free token |
+| [FMI Open Data](https://opendata.fmi.fi/wfs) | temperature, wind speed | none |
+
+Keys are read from notebook variables and **never committed** (see `.gitignore`).
+`fetch_sample.py` validates all three APIs locally before running anything in Databricks.
+
+## Reproduce
+1. Sign up for [Databricks Free Edition](https://www.databricks.com/learn/free-edition).
+2. Get a Fingrid key + ENTSO-E token (see table above).
+3. Run notebooks `01 → 02 → 03` (set keys in the config cell of `01`).
+4. Build the AI/BI dashboard from `dashboard/dashboard_queries.sql`.
